@@ -1,0 +1,5 @@
+{
+  "name": "Copy of UK Postbox Classifier",
+  "description": "An intelligent mail classification assistant using Gemini Vision to categorize scanned mail based on strict routing rules.",
+  "requestFramePermissions": []
+}

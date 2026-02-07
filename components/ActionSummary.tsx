@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { BatchItem, ClassificationType, MailAnalysisResult } from '../types';
+import ExcelJS from 'exceljs';
 import { 
   ArchiveBoxIcon, 
   ClipboardDocumentListIcon, 
@@ -10,7 +11,10 @@ import {
   TruckIcon,
   XMarkIcon,
   MagnifyingGlassIcon,
-  MapPinIcon
+  MapPinIcon,
+  TableCellsIcon,
+  ArrowDownTrayIcon,
+  CommandLineIcon
 } from '@heroicons/react/24/outline';
 
 interface ActionSummaryProps {
@@ -21,6 +25,7 @@ type ConsignmentType = 'ayr' | 'oz' | null;
 
 const ActionSummary: React.FC<ActionSummaryProps> = ({ items }) => {
   const [activeConsignment, setActiveConsignment] = useState<ConsignmentType>(null);
+  const [isExporting, setIsExporting] = useState(false);
 
   const groupedResults = useMemo(() => {
     const groups = {
@@ -53,6 +58,139 @@ const ActionSummary: React.FC<ActionSummaryProps> = ({ items }) => {
 
   if (!hasResults) return null;
 
+  // --- Export Handlers ---
+
+  const getAllResults = () => {
+    return items
+      .filter(i => i.status === 'success' && i.results)
+      .flatMap(i => i.results!);
+  };
+
+  const handleExportCSV = () => {
+    const allResults = getAllResults();
+    if (allResults.length === 0) return;
+
+    const headers = ['Item ID', 'Date', 'Sender', 'Recipient', 'Classification', 'Original Address', 'Reason', 'Filename'];
+    const rows = allResults.map(r => [
+        r.itemId,
+        r.deadline || '',
+        `"${(r.sender || '').replace(/"/g, '""')}"`,
+        `"${(r.addressee || '').replace(/"/g, '""')}"`,
+        r.classification,
+        `"${(r.originalAddress || '').replace(/"/g, '""')}"`,
+        `"${(r.reason || '').replace(/"/g, '""')}"`,
+        r.suggestedFilename
+      ].join(','));
+    
+    const csvContent = [headers.join(','), ...rows].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `uk_postbox_export_${new Date().toISOString().slice(0,10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const handleExportExcel = async () => {
+    setIsExporting(true);
+    try {
+        const allResults = getAllResults();
+        if (allResults.length === 0) return;
+
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Mail Items');
+        
+        worksheet.columns = [
+          { header: 'Item ID', key: 'itemId', width: 15 },
+          { header: 'Date', key: 'date', width: 15 },
+          { header: 'Sender', key: 'sender', width: 25 },
+          { header: 'Recipient', key: 'recipient', width: 20 },
+          { header: 'Classification', key: 'classification', width: 30 },
+          { header: 'Address', key: 'address', width: 35 },
+          { header: 'Reason', key: 'reason', width: 40 },
+          { header: 'Filename', key: 'filename', width: 30 }
+        ];
+
+        // Style headers
+        worksheet.getRow(1).font = { bold: true };
+        worksheet.getRow(1).fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFE0F2FE' } // light blue
+        };
+
+        allResults.forEach(r => {
+          worksheet.addRow({
+            itemId: r.itemId,
+            date: r.deadline,
+            sender: r.sender,
+            recipient: r.addressee,
+            classification: r.classification,
+            address: r.originalAddress,
+            reason: r.reason,
+            filename: r.suggestedFilename
+          });
+        });
+
+        const buffer = await workbook.xlsx.writeBuffer();
+        const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `uk_postbox_export_${new Date().toISOString().slice(0,10)}.xlsx`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    } catch (e) {
+        alert("Excel Generation Failed: " + e);
+    } finally {
+        setIsExporting(false);
+    }
+  };
+
+  const handleGenerateAgentSummary = async () => {
+      if (!hasResults) return;
+
+      const promptParts = ["You are helping me manage my UK Postbox inbox. Please perform the following actions for these specific mail items:\n"];
+
+      if (groupedResults.ayr.length > 0) {
+          promptParts.push(`\n### GROUP 1: FORWARD TO AYR (10 Uist Wynd, KA7 4GF)`);
+          groupedResults.ayr.forEach(r => promptParts.push(`- [ ] ID: ${r.itemId} | Sender: ${r.sender}`));
+      }
+
+      if (groupedResults.oz.length > 0) {
+          promptParts.push(`\n### GROUP 2: FORWARD TO AUSTRALIA (Nishant Dougall)`);
+          groupedResults.oz.forEach(r => promptParts.push(`- [ ] ID: ${r.itemId} | Sender: ${r.sender}`));
+      }
+
+      if (groupedResults.shred.length > 0) {
+          promptParts.push(`\n### GROUP 3: SHRED / RECYCLE`);
+          groupedResults.shred.forEach(r => promptParts.push(`- [ ] ID: ${r.itemId} | Sender: ${r.sender}`));
+      }
+
+      if (groupedResults.action.length > 0) {
+          promptParts.push(`\n### GROUP 4: DIGITAL ONLY (Action Required - Do Not Shred Yet)`);
+          groupedResults.action.forEach(r => promptParts.push(`- [ ] ID: ${r.itemId} | Sender: ${r.sender} | Reason: ${r.reason}`));
+      }
+
+      if (groupedResults.digital.length > 0) {
+          promptParts.push(`\n### GROUP 5: DIGITAL STORE (Already scanned, safe to archive/ignore)`);
+          groupedResults.digital.forEach(r => promptParts.push(`- [ ] ID: ${r.itemId} | Sender: ${r.sender}`));
+      }
+      
+      const prompt = promptParts.join('\n');
+      
+      try {
+          await navigator.clipboard.writeText(prompt);
+          alert("Success! Agent Prompt copied to clipboard. You can paste this into a browser agent or LLM.");
+      } catch (e) {
+          console.error(e);
+          alert("Clipboard Access Denied: Please check your browser permissions.");
+      }
+  };
+
   // --- Handlers ---
 
   const copyToClipboard = (title: string, results: MailAnalysisResult[]) => {
@@ -60,13 +198,13 @@ const ActionSummary: React.FC<ActionSummaryProps> = ({ items }) => {
     const idList = results.map(r => `- Item ID: ${r.itemId} (${r.addressee})`).join('\n');
     const message = `REQUEST: ${title}\n\nPlease process the following items:\n${idList}\n\nThank you.`.trim();
     navigator.clipboard.writeText(message);
-    alert(`Copied details for ${results.length} items to clipboard.`);
+    alert(`Success: Copied details for ${results.length} items.`);
   };
 
   const copyIdsForSearch = (results: MailAnalysisResult[]) => {
       const ids = results.map(r => r.itemId).join(', ');
       navigator.clipboard.writeText(ids);
-      alert("Item IDs copied! You can paste these into the UK Postbox search bar.");
+      alert("Item IDs copied! Paste these into the UK Postbox search bar.");
   };
 
   const handleOpenGoogleCalendar = () => {
@@ -252,7 +390,7 @@ const ActionSummary: React.FC<ActionSummaryProps> = ({ items }) => {
   return (
     <>
         <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden mb-8">
-        <div className="p-4 border-b border-gray-200 bg-gray-50 flex items-center justify-between">
+        <div className="p-4 border-b border-gray-200 bg-gray-50 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
             <div className="flex items-center gap-3">
             <h3 className="text-lg font-bold text-gray-900 flex items-center gap-2">
                 <ClipboardDocumentListIcon className="w-5 h-5 text-brand-600" />
@@ -262,7 +400,32 @@ const ActionSummary: React.FC<ActionSummaryProps> = ({ items }) => {
                 {totalItems} Scans Classified
             </span>
             </div>
-            <span className="text-xs text-gray-500 hidden sm:block">Grouped by Routing Logic</span>
+            
+            <div className="flex items-center gap-2">
+                <button 
+                    onClick={handleGenerateAgentSummary}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-50 text-purple-700 text-xs font-bold uppercase rounded-lg border border-purple-200 hover:bg-purple-100 transition-colors"
+                    title="Copy summary for AI Browser Agents (e.g. Comet)"
+                >
+                    <CommandLineIcon className="w-4 h-4" />
+                    Agent Prompt
+                </button>
+                <button 
+                    onClick={handleExportExcel} 
+                    disabled={isExporting}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-green-50 text-green-700 text-xs font-bold uppercase rounded-lg border border-green-200 hover:bg-green-100 transition-colors"
+                >
+                    <TableCellsIcon className="w-4 h-4" />
+                    {isExporting ? 'Generating...' : 'Export Excel'}
+                </button>
+                <button 
+                    onClick={handleExportCSV}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-50 text-slate-700 text-xs font-bold uppercase rounded-lg border border-slate-200 hover:bg-slate-100 transition-colors"
+                >
+                    <ArrowDownTrayIcon className="w-4 h-4" />
+                    CSV
+                </button>
+            </div>
         </div>
         
         <div className="p-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">

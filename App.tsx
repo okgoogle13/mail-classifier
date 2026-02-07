@@ -1,428 +1,658 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { EnvelopeIcon, SparklesIcon, XCircleIcon, CheckCircleIcon, ClockIcon, EyeIcon, ExclamationCircleIcon, CloudIcon, CloudArrowUpIcon, Cog6ToothIcon, ArrowRightOnRectangleIcon, KeyIcon, ComputerDesktopIcon, BoltIcon, FolderOpenIcon, PlayIcon } from '@heroicons/react/24/solid';
-import { ArrowPathIcon, DocumentDuplicateIcon, TableCellsIcon, ArrowUpTrayIcon, FolderArrowDownIcon, DocumentTextIcon, DocumentMagnifyingGlassIcon, ClipboardDocumentListIcon } from '@heroicons/react/24/outline';
+import { EnvelopeIcon, SparklesIcon, XCircleIcon, CheckCircleIcon, ClockIcon, EyeIcon, ExclamationCircleIcon, CloudIcon, PlayIcon, LightBulbIcon, InformationCircleIcon, BoltIcon, ChartBarIcon, ArrowPathIcon, QuestionMarkCircleIcon, Cog6ToothIcon, ExclamationTriangleIcon } from '@heroicons/react/24/solid';
+import { TableCellsIcon, FolderArrowDownIcon, ClipboardDocumentListIcon, ArrowTrendingUpIcon } from '@heroicons/react/24/outline';
 import JSZip from 'jszip';
-import { jsPDF } from "jspdf";
-import ExcelJS from 'exceljs';
 import FileUpload from './components/FileUpload';
 import AnalysisCard from './components/AnalysisCard';
 import ActionSummary from './components/ActionSummary';
+import { SettingsModal } from './components/SettingsModal';
 import { analyzeMailItem } from './services/geminiService';
 import { initGoogleDrive, authenticateDrive, openFolderPicker, listFilesInFolder, getFileBase64 } from './services/googleDriveService';
+import { optimizeFile } from './services/optimizationService';
 import { BatchItem, ClassificationType } from './types';
 
-interface SourceConfig {
-  type: 'drive' | 'local';
-  name: string;
-  id?: string; // For Drive
-  handle?: any; // For Local FileSystemDirectoryHandle
-}
+const HEAVY_FILE_THRESHOLD = 8 * 1024 * 1024; // 8MB
+
+const EFFICIENCY_TIPS = [
+    "DPI Matters: 150-200 DPI is the sweet spot. Higher resolutions slow down AI analysis without adding accuracy.",
+    "File Naming: UK Postbox reference IDs in filenames help the AI verify identity more quickly.",
+    "B&W vs Color: Greyscale scans upload 4x faster and are often easier for the AI to OCR.",
+    "ZIP Power: Uploading a ZIP of 50 files is significantly more reliable than dragging 50 individual items.",
+    "Multi-Letter PDFs: One PDF containing 10 letters? No problem. Our AI splits them automatically.",
+    "Avoid Shadows: High-contrast shadows in phone-scanned mail can confuse address detection logic."
+];
+
+// Helper to safely infer MIME type if the browser misses it (common with ZIPs)
+const inferMimeType = (filename: string, existingType?: string): string => {
+    if (existingType && existingType.trim() !== "") return existingType;
+    
+    const ext = filename.split('.').pop()?.toLowerCase();
+    switch (ext) {
+        case 'pdf': return 'application/pdf';
+        case 'jpg':
+        case 'jpeg': return 'image/jpeg';
+        case 'png': return 'image/png';
+        case 'webp': return 'image/webp';
+        case 'heic': return 'image/heic';
+        case 'heif': return 'image/heif';
+        default: return ''; // Let the service handle the error if unknown
+    }
+};
 
 const App: React.FC = () => {
   const [items, setItems] = useState<BatchItem[]>([]);
   const [processingId, setProcessingId] = useState<string | null>(null);
-  const [isManualMode, setIsManualMode] = useState(false);
   const [isExtracting, setIsExtracting] = useState(false);
-  const [extractionMsg, setExtractionMsg] = useState('');
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [initError, setInitError] = useState(false);
+  const [tipIndex, setTipIndex] = useState(0);
   
-  // Processing Engine State
+  // Settings & Optimization State
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isOptimizeEnabled, setIsOptimizeEnabled] = useState(false);
+  
+  // Drive State
+  const [driveConfig, setDriveConfig] = useState<{ id: string; name: string } | null>(null);
+  const [isDriveLoading, setIsDriveLoading] = useState(false);
+  
+  // Progress Engine State
   const engineActiveRef = useRef<boolean>(false);
   const itemsRef = useRef<BatchItem[]>([]);
+  const [statusHeartbeat, setStatusHeartbeat] = useState("System Ready");
   
-  // Update ref immediately on items change
+  useEffect(() => { itemsRef.current = items; }, [items]);
+
+  // Tip Rotation logic
   useEffect(() => {
-    itemsRef.current = items;
-  }, [items]);
+    const interval = setInterval(() => {
+        setTipIndex(prev => (prev + 1) % EFFICIENCY_TIPS.length);
+    }, 8000);
+    return () => clearInterval(interval);
+  }, []);
 
-  // Source Integration State (Drive or Local)
-  const [sourceConfig, setSourceConfig] = useState<SourceConfig | null>(null);
-  const [isDriveReady, setIsDriveReady] = useState(false);
-  const [isInitializing, setIsInitializing] = useState(true);
-  const [isLoadingSourceFiles, setIsLoadingSourceFiles] = useState(false);
-  const [isConnectingDrive, setIsConnectingDrive] = useState(false);
-
-  const folderInputRef = useRef<HTMLInputElement>(null);
-
-  const [configForm, setConfigForm] = useState({
-      clientId: localStorage.getItem('ukpostbox_google_client_id') || '867091085935-juv1m57ivbm98selovn02nr9onon6p3o.apps.googleusercontent.com',
-      apiKey: localStorage.getItem('ukpostbox_google_api_key') || 'AIzaSyCujDvQWeakswsYBjGa59LaGrE8rs2U16E',
-      appId: localStorage.getItem('ukpostbox_google_app_id') || '867091085935'
-  });
-  
   useEffect(() => {
-    const loadDrive = async () => {
-        setIsInitializing(true);
+    // Load persisted drive config
+    const savedConfig = localStorage.getItem('ukpostbox_drive_config');
+    if (savedConfig) {
         try {
-            const success = await initGoogleDrive();
-            if (success) {
-                setIsDriveReady(true);
-                const savedConfig = localStorage.getItem('ukpostbox_drive_config');
-                if (savedConfig) {
-                    const config = JSON.parse(savedConfig);
-                    if (config.id && config.name) {
-                        const newConfig: SourceConfig = { type: 'drive', id: config.id, name: config.name };
-                        setSourceConfig(newConfig);
-                        fetchSourceFiles(newConfig).catch(console.error);
-                    }
-                }
-            }
+            setDriveConfig(JSON.parse(savedConfig));
         } catch (e) {
-            console.warn("Drive integration unavailable:", e);
-        } finally {
-            setIsInitializing(false);
+            localStorage.removeItem('ukpostbox_drive_config');
         }
-    };
-    loadDrive();
-  }, []); 
-
-  const handleSaveConfig = async (e: React.FormEvent) => {
-      e.preventDefault();
-      localStorage.setItem('ukpostbox_google_client_id', configForm.clientId.trim());
-      localStorage.setItem('ukpostbox_google_api_key', configForm.apiKey.trim());
-      localStorage.setItem('ukpostbox_google_app_id', configForm.appId.trim());
-      window.location.reload();
-  };
+    }
+    
+    // Attempt initialization
+    initGoogleDrive()
+        .then((success) => {
+            setIsInitializing(false);
+            if (!success) {
+                console.warn("Google Drive initialization returned false. Configuration may be missing or invalid.");
+                setInitError(true);
+                // If we know keys are missing, we could prompt user immediately, 
+                // but let's just let the UI show the warning icon to be less intrusive.
+            }
+        })
+        .catch((e) => {
+            console.error("Google Drive init error:", e);
+            setIsInitializing(false);
+            setInitError(true);
+        });
+  }, []);
 
   const handleConnectDrive = async () => {
-      setIsConnectingDrive(true);
+      if (initError) {
+          setIsSettingsOpen(true);
+          return;
+      }
+
+      setIsDriveLoading(true);
       try {
           const token = await authenticateDrive();
           const folder = await openFolderPicker(token);
           if (folder) {
-              const newConfig: SourceConfig = { type: 'drive', id: folder.id, name: folder.name };
-              setSourceConfig(newConfig);
-              localStorage.setItem('ukpostbox_drive_config', JSON.stringify({ id: folder.id, name: folder.name }));
-              setItems([]);
-              fetchSourceFiles(newConfig);
+              setDriveConfig(folder);
+              localStorage.setItem('ukpostbox_drive_config', JSON.stringify(folder));
           }
       } catch (e: any) {
-          console.error("Error picking folder", e);
-      } finally {
-          setIsConnectingDrive(false);
-      }
-  };
-
-  const handleConnectLocal = async () => {
-      if ('showDirectoryPicker' in window) {
-          try {
-              const handle = await (window as any).showDirectoryPicker();
-              const newConfig: SourceConfig = { type: 'local', name: handle.name, handle };
-              setSourceConfig(newConfig);
-              setItems([]); 
-              fetchSourceFiles(newConfig);
-              return;
-          } catch (e: any) {}
-      }
-      folderInputRef.current?.click();
-  };
-
-  const handleFolderInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 0) {
-       const files = Array.from(e.target.files) as File[];
-       const folderName = files[0].webkitRelativePath?.split('/')[0] || "Local Folder";
-       setSourceConfig({ type: 'local', name: folderName });
-       setItems([]);
-       handleFilesAdd(files);
-    }
-  };
-
-  const handleDisconnect = () => {
-      items.forEach(i => i.previewUrl && !i.previewUrl.startsWith('http') && URL.revokeObjectURL(i.previewUrl));
-      setSourceConfig(null);
-      setItems([]);
-      localStorage.removeItem('ukpostbox_drive_config');
-      setIsManualMode(false);
-  };
-
-  const handleResetCredentials = () => {
-      if(confirm("Disconnect and clear all settings?")) {
-          localStorage.clear();
-          window.location.reload();
-      }
-  };
-
-  const fetchSourceFiles = async (config: SourceConfig) => {
-      setIsLoadingSourceFiles(true);
-      try {
-          if (config.type === 'drive' && config.id) {
-              const files = await listFilesInFolder(config.id);
-              const existingIds = new Set(itemsRef.current.map(p => p.driveFileId));
-              const newItems = files
-                .filter(f => !existingIds.has(f.id))
-                .map(f => ({
-                    id: f.id,
-                    driveFileId: f.id,
-                    name: f.name,
-                    driveMimeType: f.mimeType,
-                    status: 'idle' as const,
-                    previewUrl: f.thumbnailLink
-                }));
-              setItems(prev => [...prev, ...newItems]);
-          } else if (config.type === 'local' && config.handle) {
-              const newItems: BatchItem[] = [];
-              for await (const entry of config.handle.values()) {
-                  if (entry.kind === 'file') {
-                      const lowerName = entry.name.toLowerCase();
-                      if (lowerName.endsWith('.pdf') || lowerName.match(/\.(jpg|jpeg|png)$/)) {
-                          const file = await entry.getFile();
-                          newItems.push({
-                              id: Math.random().toString(36).substr(2, 9),
-                              file: file,
-                              name: file.name,
-                              status: 'idle' as const,
-                              previewUrl: URL.createObjectURL(file)
-                          });
-                      }
-                  }
+          if (e.message && e.message.includes("User cancelled")) {
+              // Ignore cancellation
+          } else {
+              alert(`Drive Connection Failed: ${e.message || e}`);
+              // If it failed due to init issues, prompting settings might help
+              if (e.message && (e.message.includes("not initialized") || e.message.includes("origin mismatch"))) {
+                  setIsSettingsOpen(true);
               }
-              const existingNames = new Set(itemsRef.current.map(p => p.name));
-              const filtered = newItems.filter(i => !existingNames.has(i.name));
-              setItems(prev => [...prev, ...filtered]);
           }
-      } catch (e: any) {
-          console.error("Fetch error", e);
       } finally {
-          setIsLoadingSourceFiles(false);
+          setIsDriveLoading(false);
       }
   };
 
-  const getWeekBatchId = () => {
-    const date = new Date();
-    const year = date.getFullYear();
-    const firstDayOfYear = new Date(year, 0, 1);
-    const pastDaysOfYear = (date.getTime() - firstDayOfYear.getTime()) / 86400000;
-    const weekNum = Math.ceil((pastDaysOfYear + firstDayOfYear.getDay() + 1) / 7);
-    return `${year}-${weekNum.toString().padStart(2, '0')}`;
+  const handleDisconnectDrive = () => {
+      if (confirm("Disconnect Google Drive Folder?")) {
+          setDriveConfig(null);
+          localStorage.removeItem('ukpostbox_drive_config');
+      }
+  };
+
+  const handleImportFromDrive = async () => {
+      if (!driveConfig) return;
+      setIsExtracting(true);
+      setStatusHeartbeat(`Scanning folder "${driveConfig.name}"...`);
+      try {
+          const files = await listFilesInFolder(driveConfig.id);
+          if (files.length === 0) {
+              alert("No suitable files (PDF/Image) found in the selected folder.");
+              return;
+          }
+          
+          const newItems: BatchItem[] = files.map(f => ({
+              id: Math.random().toString(36).substr(2, 9),
+              driveFileId: f.id,
+              driveMimeType: f.mimeType,
+              name: f.name,
+              status: 'idle',
+              previewUrl: f.thumbnailLink // Drive provides thumbnails
+          }));
+          
+          // Filter out duplicates based on driveFileId
+          const existingIds = new Set(items.map(i => i.driveFileId).filter(Boolean));
+          const uniqueItems = newItems.filter(i => !existingIds.has(i.driveFileId));
+
+          if (uniqueItems.length === 0) {
+              setStatusHeartbeat("No new files found to import.");
+          } else {
+              setItems(prev => [...prev, ...uniqueItems]);
+              setStatusHeartbeat(`Successfully queued ${uniqueItems.length} items from Drive.`);
+          }
+      } catch (e: any) {
+          alert("Failed to list files from Drive: " + e.message);
+      } finally {
+          setIsExtracting(false);
+          setTimeout(() => setStatusHeartbeat("Ready for processing"), 2000);
+      }
   };
 
   const handleFilesAdd = async (files: File[]) => {
+    if (files.length === 0) return;
     setIsExtracting(true);
-    setExtractionMsg('Reading batch...');
+    
+    // Initial status
+    setStatusHeartbeat(isOptimizeEnabled ? "Turbo Mode: Optimizing images..." : `Preparing ${files.length} items for queue...`);
+    
     try {
-        const processedFiles: File[] = [];
-        for (const file of files) {
-            const isZip = file.name.toLowerCase().endsWith('.zip') || file.type.includes('zip');
+        const processedItems: BatchItem[] = [];
+        
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            
+            if (isOptimizeEnabled) {
+                setStatusHeartbeat(`Optimizing ${i + 1}/${files.length}: ${file.name}`);
+            }
+
+            const isZip = file.name.toLowerCase().endsWith('.zip');
             if (isZip) {
                 const zip = new JSZip();
-                const loadedZip = await zip.loadAsync(file);
-                const fileKeys = Object.keys(loadedZip.files);
-                for (const fileName of fileKeys) {
-                    if (fileName.includes('__MACOSX') || fileName.includes('.DS_Store')) continue;
-                    const entry = loadedZip.files[fileName];
+                const loaded = await zip.loadAsync(file);
+                for (const name of Object.keys(loaded.files)) {
+                    if (name.includes('__MACOSX') || name.startsWith('.')) continue;
+                    const entry = loaded.files[name];
                     if (entry.dir) continue;
-                    const lowerName = fileName.toLowerCase();
-                    if (lowerName.endsWith('.pdf') || lowerName.match(/\.(jpg|jpeg|png)$/)) {
-                        const blob = await entry.async('blob');
-                        let type = blob.type;
-                        if (!type || type === 'application/octet-stream') {
-                            if (lowerName.endsWith('.pdf')) type = 'application/pdf';
-                            else if (lowerName.endsWith('.jpg')) type = 'image/jpeg';
-                            else if (lowerName.endsWith('.png')) type = 'image/png';
+                    const blob = await entry.async('blob');
+                    
+                    let processedFile = new File([blob], name.split('/').pop()!, { type: blob.type || '' });
+                    
+                    // Recursive optimization for ZIP contents if enabled
+                    if (isOptimizeEnabled) {
+                        try {
+                            processedFile = await optimizeFile(processedFile);
+                        } catch (err) {
+                            console.warn("Failed to optimize inner zip file:", name, err);
                         }
-                        processedFiles.push(new File([blob], fileName.split('/').pop()!, { type }));
                     }
+
+                    processedItems.push({
+                        id: Math.random().toString(36).substr(2, 9),
+                        file: processedFile,
+                        name: name.split('/').pop()!,
+                        status: 'idle',
+                        previewUrl: URL.createObjectURL(processedFile)
+                    });
                 }
             } else {
-                processedFiles.push(file);
+                let processedFile = file;
+                if (isOptimizeEnabled) {
+                     processedFile = await optimizeFile(file);
+                }
+
+                processedItems.push({
+                    id: Math.random().toString(36).substr(2, 9),
+                    file: processedFile,
+                    name: processedFile.name,
+                    status: 'idle',
+                    previewUrl: URL.createObjectURL(processedFile)
+                });
             }
         }
-        const validFiles = processedFiles.filter(file => file.type.startsWith('image/') || file.type === 'application/pdf');
-        const newItems: BatchItem[] = validFiles.map(file => ({
-            id: Math.random().toString(36).substr(2, 9),
-            file,
-            name: file.name,
-            status: 'idle',
-            previewUrl: URL.createObjectURL(file)
-        }));
-        setItems(prev => [...prev, ...newItems]);
-        setIsManualMode(true);
+        setItems(prev => [...prev, ...processedItems]);
     } catch (e: any) {
-        alert("Error unpacking: " + e.message);
+        alert("Could not process your files: " + e.message);
     } finally {
         setIsExtracting(false);
-        setExtractionMsg('');
+        setStatusHeartbeat("Ready");
     }
   };
 
-  // --- STABLE SEQUENTIAL ENGINE ---
   const startEngine = useCallback(async () => {
     if (engineActiveRef.current) return;
     engineActiveRef.current = true;
 
     while (true) {
-      const nextItem = itemsRef.current.find(i => i.status === 'idle');
-      if (!nextItem) break;
+      const next = itemsRef.current.find(i => i.status === 'idle');
+      if (!next) break;
 
-      setProcessingId(nextItem.id);
-      setItems(prev => prev.map(i => i.id === nextItem.id ? { ...i, status: 'analyzing', statusMessage: 'Preparing data...' } : i));
+      setProcessingId(next.id);
+      setItems(prev => prev.map(i => i.id === next.id ? { ...i, status: 'analyzing', statusMessage: 'Preparing document...' } : i));
+      setStatusHeartbeat("Initializing AI Analyst...");
 
       try {
-        let base64Content = "";
-        let mimeType = "";
+        let base64 = "";
+        let mime = "application/pdf";
+        let fileObj = next.file;
 
-        if (nextItem.driveFileId) {
-             base64Content = await getFileBase64(nextItem.driveFileId);
-             mimeType = nextItem.driveMimeType || 'application/pdf';
-        } else if (nextItem.file) {
-             base64Content = await new Promise((res, rej) => {
-                const reader = new FileReader();
-                reader.onload = () => res((reader.result as string).split(',')[1]);
-                reader.onerror = (e) => rej(new Error("File read error: " + e));
-                reader.readAsDataURL(nextItem.file!);
-             });
-             mimeType = nextItem.file.type;
+        if (next.driveFileId) {
+            setStatusHeartbeat("Downloading file from Google Drive...");
+            base64 = await getFileBase64(next.driveFileId);
+            if (next.driveMimeType) mime = next.driveMimeType;
+            
+            // Reconstruct File object for UI components (download/preview/upload)
+            const byteCharacters = atob(base64);
+            const byteNumbers = new Array(byteCharacters.length);
+            for (let i = 0; i < byteCharacters.length; i++) {
+                byteNumbers[i] = byteCharacters.charCodeAt(i);
+            }
+            const byteArray = new Uint8Array(byteNumbers);
+            const blob = new Blob([byteArray], { type: mime });
+            fileObj = new File([blob], next.name, { type: mime });
+        } else if (next.file) {
+            // Apply robust inference here
+            mime = inferMimeType(next.name, next.file.type);
+            setStatusHeartbeat("Reading local file...");
+            
+            base64 = await new Promise((res, rej) => {
+                const r = new FileReader();
+                r.onload = () => res((r.result as string).split(',')[1]);
+                r.onerror = () => rej(new Error("Local file read failed. Check permissions."));
+                r.readAsDataURL(next.file!);
+            });
         }
 
-        if (!base64Content) throw new Error("File content is empty.");
+        const results = await analyzeMailItem(base64, mime, { filename: next.name }, (msg) => {
+            setItems(prev => prev.map(i => i.id === next.id ? { ...i, statusMessage: msg } : i));
+            setStatusHeartbeat(msg);
+        });
 
-        const results = await analyzeMailItem(
-            base64Content, 
-            mimeType, 
-            { filename: nextItem.name, week_batch_id: getWeekBatchId() },
-            (msg) => setItems(prev => prev.map(i => i.id === nextItem.id ? { ...i, statusMessage: msg } : i))
-        );
-
-        const hasTBC = results.some(r => r.classification === ClassificationType.TBC);
-        setItems(prev => prev.map(i => i.id === nextItem.id ? { ...i, status: hasTBC ? 'needs_manual_review' : 'success', results, statusMessage: undefined } : i));
-        
+        setItems(prev => prev.map(i => i.id === next.id ? { ...i, status: 'success', results, file: fileObj } : i));
       } catch (error: any) {
-        console.error(`Engine Error on ${nextItem.name}:`, error);
-        setItems(prev => prev.map(i => i.id === nextItem.id ? { ...i, status: 'error', error: error.message || "Unknown analysis error", statusMessage: undefined } : i));
+        setItems(prev => prev.map(i => i.id === next.id ? { ...i, status: 'error', error: error.message } : i));
+        setStatusHeartbeat("Analysis failed for current item.");
+      } finally {
+        setStatusHeartbeat("Pacing requests (Rate Limit Guard)...");
+        await new Promise(res => setTimeout(res, 8500));
       }
-
-      // Safe pause between items (approx 7.5s for deep thinking stability)
-      await new Promise(res => setTimeout(res, 7500));
     }
-
     setProcessingId(null);
     engineActiveRef.current = false;
+    setStatusHeartbeat("Queue finished. All tasks complete.");
   }, []);
 
   useEffect(() => {
-    const hasIdle = items.some(i => i.status === 'idle');
-    if (hasIdle && !engineActiveRef.current) {
-      startEngine();
-    }
+    if (items.some(i => i.status === 'idle') && !engineActiveRef.current) startEngine();
   }, [items, startEngine]);
 
-  const removeItem = (id: string) => {
-    setItems(prev => {
-        const item = prev.find(i => i.id === id);
-        if (item?.previewUrl && !item.previewUrl.startsWith('http')) URL.revokeObjectURL(item.previewUrl);
-        return prev.filter(i => i.id !== id);
-    });
-  };
+  const completedCount = items.filter(i => i.status === 'success' || i.status === 'error').length;
+  const totalCount = items.length;
+  const progressPercent = totalCount > 0 ? (completedCount / totalCount) * 100 : 0;
+  
+  const estMinutesLeft = Math.ceil(((totalCount - completedCount) * 30) / 60);
 
-  const getProcessedItems = () => items.filter(i => (i.status === 'success' || i.status === 'needs_manual_review') && i.results);
-
-  const handleDownloadCSV = () => {
-      const processed = getProcessedItems();
-      if (processed.length === 0) return;
-      const headers = ["Item ID", "Filename", "Class", "Routing", "Action", "Sender", "Recipient", "Date"];
-      const rows = processed.flatMap(item => (item.results || []).map(r => [
-          r.itemId, r.suggestedFilename, r.classification, r.routing || "N/A", r.auto_action || r.tag, r.sender, r.addressee, r.deadline
-      ].map(f => `"${(f || '').toString().replace(/"/g, '""')}"`).join(',')));
-      const blob = new Blob([[headers.join(','), ...rows].join('\n')], { type: 'text/csv' });
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
-      link.download = `Batch_${new Date().toISOString().slice(0,10)}.csv`;
-      link.click();
-  };
+  if (isInitializing) {
+    return (
+        <div className="h-screen bg-white flex flex-col items-center justify-center p-6 text-center">
+            <div className="w-12 h-12 bg-brand-600 rounded-2xl animate-bounce shadow-xl flex items-center justify-center text-white mb-4">
+                <EnvelopeIcon className="w-6 h-6" />
+            </div>
+            <h2 className="text-xl font-bold text-slate-800">Initializing Intelligence Center</h2>
+            <p className="text-slate-400 text-sm mt-1">Connecting to Google Drive & AI Services...</p>
+        </div>
+    );
+  }
 
   return (
-    <div className="min-h-screen bg-gray-50 pb-24 font-sans text-gray-900">
-      <header className="bg-white border-b border-gray-200 sticky top-0 z-20 shadow-sm">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+    <div className="min-h-screen bg-slate-50 font-sans text-slate-900 selection:bg-brand-100 selection:text-brand-900">
+      <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
+      
+      <header className="bg-white/80 border-b border-slate-200 sticky top-0 z-50 backdrop-blur-md shadow-sm">
+        <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
-             <div className="p-1.5 bg-brand-600 rounded text-white shadow-sm"><EnvelopeIcon className="w-5 h-5" /></div>
-             <span className="font-bold text-gray-900 hidden sm:block">Postbox Classifier</span>
+            <div className="bg-brand-600 p-2 rounded-xl shadow-lg">
+                <EnvelopeIcon className="w-5 h-5 text-white" />
+            </div>
+            <div>
+                <h1 className="font-bold text-slate-800 leading-none">UK Postbox AI</h1>
+                <p className="text-[10px] font-black uppercase text-brand-500 tracking-widest mt-1">Smart Routing</p>
+            </div>
           </div>
-          <div className="flex items-center gap-2">
-             {(processingId || isExtracting) && (
-                 <div className="flex items-center gap-2 px-3 py-1 bg-brand-50 text-brand-700 rounded-full text-xs font-bold animate-pulse border border-brand-100">
-                     <ArrowPathIcon className="w-4 h-4 animate-spin" />
-                     {isExtracting ? "Unpacking..." : "Thinking..."}
-                 </div>
-             )}
-             {!engineActiveRef.current && items.some(i => i.status === 'idle') && (
-                <button onClick={startEngine} className="flex items-center gap-1.5 px-3 py-1 bg-brand-600 text-white rounded-full text-xs font-bold hover:bg-brand-700 shadow-md">
-                    <PlayIcon className="w-3.5 h-3.5" /> Start Processing
+          
+          {totalCount > 0 && (
+              <div className="flex-1 max-w-md mx-8 hidden sm:block">
+                  <div className="flex items-center justify-between mb-1">
+                      <div className="flex items-center gap-2">
+                          <ChartBarIcon className="w-3 h-3 text-slate-400" />
+                          <span className="text-[10px] font-black uppercase text-slate-400">Queue Progress</span>
+                      </div>
+                      <span className="text-[10px] font-black text-brand-600">{Math.round(progressPercent)}%</span>
+                  </div>
+                  <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+                      <div className="h-full bg-brand-600 transition-all duration-1000 ease-out" style={{ width: `${progressPercent}%` }} />
+                  </div>
+              </div>
+          )}
+
+          <div className="flex items-center gap-3">
+            {/* Drive Integration */}
+            <div className="hidden sm:flex items-center gap-2">
+                <button
+                    onClick={driveConfig ? handleImportFromDrive : handleConnectDrive}
+                    disabled={isDriveLoading}
+                    className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-[10px] font-black uppercase border transition-all
+                        ${driveConfig 
+                            ? 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100' 
+                            : 'bg-slate-50 text-slate-600 border-slate-200 hover:border-brand-300 hover:text-brand-600'
+                        }
+                    `}
+                    title={driveConfig ? `Import items from folder: ${driveConfig.name}` : "Connect Google Drive to import/save items"}
+                >
+                    {isDriveLoading ? (
+                        <ArrowPathIcon className="w-3.5 h-3.5 animate-spin" />
+                    ) : driveConfig ? (
+                        <CloudIcon className="w-3.5 h-3.5" />
+                    ) : (
+                        <img src="https://upload.wikimedia.org/wikipedia/commons/1/12/Google_Drive_icon_%282020%29.svg" className="w-3.5 h-3.5" alt="Drive" />
+                    )}
+                    {isDriveLoading ? 'Connecting...' : driveConfig ? `Scan: ${driveConfig.name}` : 'Connect Drive'}
                 </button>
-             )}
-             <div className="flex items-center gap-2 px-3 py-1.5 border border-gray-200 rounded-md text-sm bg-white shadow-sm">
-                <ComputerDesktopIcon className="w-4 h-4 text-gray-400" />
-                <span className="font-medium truncate max-w-[100px]">{sourceConfig?.name || "Local Batch"}</span>
-                <button onClick={handleDisconnect} className="ml-2 text-gray-400 hover:text-red-500"><XCircleIcon className="w-4 h-4" /></button>
-             </div>
-             <button onClick={handleDownloadCSV} className="p-2 text-gray-400 hover:text-brand-600" title="Export CSV"><TableCellsIcon className="w-5 h-5" /></button>
+                
+                {driveConfig && (
+                    <button
+                        onClick={handleDisconnectDrive}
+                        className="p-1.5 text-slate-300 hover:text-red-400 transition-colors rounded-full hover:bg-red-50"
+                        title="Disconnect Folder"
+                    >
+                        <XCircleIcon className="w-5 h-5" />
+                    </button>
+                )}
+            </div>
+
+            {processingId && (
+                <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 bg-brand-50 text-brand-700 rounded-full text-[10px] font-black uppercase border border-brand-100 animate-pulse">
+                    <BoltIcon className="w-3 h-3 text-brand-500" />
+                    {statusHeartbeat}
+                </div>
+            )}
+            
+            <div className="h-6 w-px bg-slate-200 mx-1"></div>
+
+            <button
+                onClick={() => setIsSettingsOpen(true)}
+                className={`p-2 rounded-full transition-colors relative ${initError ? 'text-amber-500 bg-amber-50 hover:bg-amber-100' : 'text-slate-400 hover:text-brand-600 hover:bg-slate-50'}`}
+                title="API Settings"
+            >
+                <Cog6ToothIcon className="w-5 h-5" />
+                {initError && (
+                    <span className="absolute -top-1 -right-1 flex h-3 w-3">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-3 w-3 bg-amber-500"></span>
+                    </span>
+                )}
+            </button>
+
+            <button 
+                onClick={() => { if(confirm("Discard current batch?")) window.location.reload(); }} 
+                className="p-2 text-slate-400 hover:text-red-600 transition-colors rounded-full hover:bg-slate-50"
+                title="Reset Workspace"
+            >
+                <XCircleIcon className="w-5 h-5"/>
+            </button>
           </div>
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
-        {!sourceConfig && items.length === 0 ? (
-            <div className="flex flex-col items-center justify-center pt-20">
-                <div className="bg-white p-8 rounded-3xl shadow-xl border border-gray-100 max-w-xl w-full text-center space-y-8">
-                    <div className="space-y-2">
-                         <h2 className="text-3xl font-extrabold text-gray-900">Upload Your Batch</h2>
-                         <p className="text-gray-500">Classify PDFs, Images, or a ZIP archive (Max 100 items)</p>
+      <main className="max-w-7xl mx-auto px-4 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
+        <div className="lg:col-span-8 space-y-8">
+          <ActionSummary items={items} />
+          
+          <div className="space-y-4">
+            <div className="flex items-center justify-between border-b pb-4 border-slate-200">
+                <div className="flex items-center gap-2">
+                    <FolderArrowDownIcon className="w-5 h-5 text-slate-400" />
+                    <h2 className="font-bold text-slate-700">Analysis Queue</h2>
+                    <span className="bg-slate-200 text-slate-600 text-[10px] font-black px-2 py-0.5 rounded-full">{items.length} Files</span>
+                </div>
+                {estMinutesLeft > 0 && (
+                    <div className="text-[10px] font-black uppercase text-slate-500 bg-white px-3 py-1 rounded-lg border border-slate-200">
+                        Remaining: ~{estMinutesLeft}m
                     </div>
-                    <FileUpload onFilesSelect={handleFilesAdd} isProcessing={!!processingId || isExtracting} />
-                    <div className="pt-6 border-t border-gray-50 flex items-center justify-center gap-4">
-                        <button onClick={handleConnectDrive} className="px-4 py-2 bg-white border border-gray-200 rounded-lg text-sm font-semibold flex items-center gap-2 shadow-sm hover:bg-gray-50"><CloudIcon className="w-4 h-4 text-brand-500" /> Google Drive</button>
-                        <button onClick={handleConnectLocal} className="px-4 py-2 bg-white border border-gray-200 rounded-lg text-sm font-semibold flex items-center gap-2 shadow-sm hover:bg-gray-50"><FolderOpenIcon className="w-4 h-4 text-indigo-500" /> Local Folder</button>
+                )}
+            </div>
+            
+            {items.length === 0 ? (
+                <div className="bg-white border-2 border-dashed border-slate-200 rounded-[2.5rem] p-16 text-center space-y-6">
+                    <div className="bg-slate-50 w-20 h-20 rounded-[2rem] flex items-center justify-center mx-auto rotate-6 shadow-inner">
+                        <CloudIcon className="w-10 h-10 text-slate-300" />
+                    </div>
+                    <div className="max-w-sm mx-auto">
+                        <h3 className="text-xl font-bold text-slate-800">Your mailroom is ready</h3>
+                        <p className="text-sm text-slate-500 mt-1">Upload your UK Postbox scans to begin automated routing and metadata extraction.</p>
+                    </div>
+                    <div className="max-w-xs mx-auto pt-4 space-y-3">
+                        <FileUpload 
+                            onFilesSelect={handleFilesAdd} 
+                            isProcessing={isExtracting} 
+                            onOptimizeToggle={setIsOptimizeEnabled}
+                            isOptimizeEnabled={isOptimizeEnabled}
+                        />
+                        
+                        {driveConfig ? (
+                            <button
+                                onClick={handleImportFromDrive}
+                                disabled={isExtracting}
+                                className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-2xl border border-blue-100 bg-blue-50 text-blue-700 text-xs font-bold uppercase tracking-widest hover:bg-blue-100 transition-all"
+                            >
+                                <CloudIcon className="w-4 h-4" />
+                                Import from {driveConfig.name}
+                            </button>
+                        ) : (
+                            <button
+                                onClick={handleConnectDrive}
+                                disabled={isDriveLoading}
+                                className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-2xl border border-slate-200 bg-white text-slate-600 text-xs font-bold uppercase tracking-widest hover:bg-slate-50 hover:text-slate-800 transition-all"
+                            >
+                                <img src="https://upload.wikimedia.org/wikipedia/commons/1/12/Google_Drive_icon_%282020%29.svg" className="w-4 h-4" alt="Drive" />
+                                {initError ? 'Check API Settings' : 'Connect Google Drive'}
+                            </button>
+                        )}
+                        {initError && (
+                             <button onClick={() => setIsSettingsOpen(true)} className="w-full flex items-center justify-center gap-1.5 text-[10px] text-amber-600 font-bold bg-amber-50 p-2 rounded-lg hover:bg-amber-100 transition-colors">
+                                <ExclamationTriangleIcon className="w-3 h-3" />
+                                API Config Missing or Invalid. Click to Fix.
+                             </button>
+                        )}
+                    </div>
+                </div>
+            ) : (
+                <div className="grid grid-cols-1 gap-4">
+                    {items.map(item => (
+                        <div key={item.id} className={`bg-white rounded-3xl border transition-all duration-500 ${item.id === processingId ? 'border-brand-400 shadow-xl ring-4 ring-brand-50' : 'border-slate-200 shadow-sm'}`}>
+                            <div className="p-5 flex items-center justify-between">
+                                <div className="flex items-center gap-4">
+                                    <div className="relative">
+                                        {item.status === 'analyzing' ? (
+                                            <div className="bg-brand-50 p-3 rounded-2xl border border-brand-100">
+                                                <ArrowPathIcon className="w-6 h-6 text-brand-600 animate-spin"/>
+                                            </div>
+                                        ) : item.status === 'success' ? (
+                                            <div className="bg-green-50 p-3 rounded-2xl border border-green-100">
+                                                <CheckCircleIcon className="w-6 h-6 text-green-600"/>
+                                            </div>
+                                        ) : item.status === 'error' ? (
+                                            <div className="bg-red-50 p-3 rounded-2xl border border-red-100">
+                                                <ExclamationCircleIcon className="w-6 h-6 text-red-600"/>
+                                            </div>
+                                        ) : (
+                                            <div className="bg-slate-50 p-3 rounded-2xl border border-slate-100">
+                                                <ClockIcon className="w-6 h-6 text-slate-300"/>
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="min-w-0">
+                                        <p className="text-sm font-black text-slate-800 truncate" title={item.name}>{item.name}</p>
+                                        <div className="flex items-center gap-2 mt-1">
+                                            <span className={`text-[10px] font-black uppercase tracking-widest ${item.status === 'analyzing' ? 'text-brand-600' : item.status === 'error' ? 'text-red-600' : 'text-slate-400'}`}>
+                                                {item.statusMessage || item.status.replace(/_/g, ' ')}
+                                            </span>
+                                            {(item.file?.size || 0) > HEAVY_FILE_THRESHOLD && (
+                                                <span className="text-[9px] bg-amber-50 text-amber-700 px-1.5 py-0.5 rounded-full font-black border border-amber-100">LARGE</span>
+                                            )}
+                                            {item.driveFileId && (
+                                                <span className="text-[9px] bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded-full font-black border border-blue-100 flex items-center gap-1">
+                                                    <CloudIcon className="w-2 h-2" /> DRIVE
+                                                </span>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                                {item.results && (
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-[10px] font-black text-slate-500 bg-slate-100 px-2.5 py-1 rounded-full border border-slate-200">
+                                            {item.results.length} Pieces found
+                                        </span>
+                                    </div>
+                                )}
+                            </div>
+                            {item.results && (
+                                <div className="px-5 pb-5 space-y-4 animate-in fade-in slide-in-from-top-2 duration-700">
+                                    <div className="border-t border-slate-50 pt-5 grid grid-cols-1 gap-5">
+                                        {item.results.map((r, i) => (
+                                            <AnalysisCard 
+                                                key={i} 
+                                                result={r} 
+                                                originalFile={item.file!} 
+                                                driveConfig={driveConfig}
+                                            />
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                            {item.error && (
+                                <div className="px-5 pb-5 animate-in slide-in-from-top-2">
+                                    <div className="bg-red-50 border border-red-100 p-4 rounded-[1.5rem] flex items-start gap-4">
+                                        <ExclamationCircleIcon className="w-6 h-6 text-red-500 mt-1" />
+                                        <div className="flex-1">
+                                            <div className="flex items-center justify-between">
+                                                <p className="text-xs font-black text-red-900 uppercase">Analysis Interrupted</p>
+                                                <QuestionMarkCircleIcon className="w-4 h-4 text-red-300 cursor-help" title="Possible causes: Corrupted PDF, Unsupported file type, or Password protection." />
+                                            </div>
+                                            <p className="text-[11px] font-medium text-red-700 mt-1 leading-relaxed">{item.error}</p>
+                                            <div className="mt-4 flex gap-3">
+                                                <button 
+                                                    onClick={() => setItems(prev => prev.map(i => i.id === item.id ? {...i, status: 'idle', error: undefined} : i))}
+                                                    className="px-4 py-2 bg-red-600 text-white text-[10px] font-black uppercase rounded-xl hover:bg-red-700 transition-colors shadow-lg shadow-red-200"
+                                                >
+                                                    Retry Item
+                                                </button>
+                                                <button 
+                                                    onClick={() => setItems(prev => prev.filter(i => i.id !== item.id))}
+                                                    className="px-4 py-2 bg-white text-slate-500 text-[10px] font-black uppercase rounded-xl border border-slate-200 hover:text-red-600 hover:border-red-200 transition-colors"
+                                                >
+                                                    Discard
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    ))}
+                </div>
+            )}
+          </div>
+        </div>
+
+        <aside className="lg:col-span-4 space-y-8">
+            <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm relative overflow-hidden group">
+                <div className="absolute top-0 right-0 p-6 opacity-[0.03] group-hover:opacity-[0.08] transition-opacity">
+                    <LightBulbIcon className="w-32 h-32 rotate-12" />
+                </div>
+                <div className="relative z-10">
+                    <div className="flex items-center gap-2.5 mb-8">
+                        <div className="bg-amber-100 p-2 rounded-xl">
+                            <LightBulbIcon className="w-4 h-4 text-amber-600" />
+                        </div>
+                        <h3 className="font-black text-slate-800 text-[11px] uppercase tracking-[0.2em]">Efficiency Logic</h3>
+                    </div>
+                    <div className="min-h-[100px] flex flex-col justify-center">
+                        <p className="text-sm text-slate-600 leading-relaxed font-bold italic animate-in fade-in">
+                            "{EFFICIENCY_TIPS[tipIndex]}"
+                        </p>
+                    </div>
+                    <div className="mt-8 flex items-center gap-2">
+                        {EFFICIENCY_TIPS.map((_, i) => (
+                            <div key={i} className={`h-1 rounded-full transition-all duration-500 ${i === tipIndex ? 'w-8 bg-brand-600' : 'w-2 bg-slate-200'}`} />
+                        ))}
                     </div>
                 </div>
             </div>
-        ) : (
-            <>
-                <ActionSummary items={items} />
-                <div className="flex justify-between items-center bg-white p-4 rounded-2xl border border-gray-200 shadow-sm">
-                    <div className="text-sm font-semibold text-gray-600">
-                        {items.filter(i => i.status === 'success' || i.status === 'needs_manual_review').length} / {items.length} Completed
-                    </div>
-                    <div className="w-48"><FileUpload onFilesSelect={handleFilesAdd} isProcessing={!!processingId || isExtracting} /></div>
-                </div>
-                <div className="space-y-4">
-                  {items.map(item => (
-                    <div key={item.id} className={`bg-white rounded-2xl border transition-all shadow-sm ${item.status === 'analyzing' ? 'border-brand-500 ring-4 ring-brand-50' : 'border-gray-200'}`}>
-                      <div className="p-4 flex items-center justify-between">
-                        <div className="flex items-center gap-4 overflow-hidden">
-                            <div className="flex-shrink-0">
-                                {item.status === 'idle' && <ClockIcon className="w-6 h-6 text-gray-300" />}
-                                {item.status === 'analyzing' && <ArrowPathIcon className="w-6 h-6 text-brand-500 animate-spin" />}
-                                {(item.status === 'success' || item.status === 'needs_manual_review') && <CheckCircleIcon className="w-6 h-6 text-green-500" />}
-                                {item.status === 'error' && <ExclamationCircleIcon className="w-6 h-6 text-red-500" />}
+
+            {items.length > 0 && (
+                <div className="bg-slate-900 p-8 rounded-[2rem] text-white shadow-2xl relative overflow-hidden">
+                    <div className="absolute top-0 right-0 -mr-12 -mt-12 w-48 h-48 bg-brand-500/10 rounded-full blur-3xl" />
+                    <div className="relative z-10">
+                        <h3 className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500 mb-8">Process Telemetry</h3>
+                        <div className="space-y-6">
+                            <div className="flex items-center justify-between">
+                                <span className="text-xs text-slate-400 font-bold uppercase tracking-tighter">Queue Size</span>
+                                <span className="text-2xl font-black">{totalCount}</span>
                             </div>
-                            <div className="min-w-0">
-                                <h3 className="text-sm font-bold truncate text-gray-900" title={item.name}>{item.name}</h3>
-                                <p className={`text-[10px] font-black uppercase tracking-widest ${item.status === 'analyzing' ? 'text-brand-600' : 'text-gray-400'}`}>
-                                    {item.status === 'analyzing' ? (item.statusMessage || 'Analyzing...') : item.status.replace(/_/g, ' ')}
-                                </p>
+                            <div className="flex items-center justify-between">
+                                <span className="text-xs text-slate-400 font-bold uppercase tracking-tighter">Est. Time</span>
+                                <span className="text-2xl font-black text-brand-400">~{estMinutesLeft}m</span>
+                            </div>
+                            <div className="pt-8 border-t border-slate-800">
+                                <button 
+                                    onClick={() => handleFilesAdd([])} 
+                                    className="w-full py-4 bg-white text-slate-900 rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-slate-100 active:scale-[0.98] transition-all shadow-xl"
+                                >
+                                    Push More Items
+                                </button>
                             </div>
                         </div>
-                        <button onClick={() => removeItem(item.id)} className="text-gray-300 hover:text-red-500 p-2"><XMarkIcon className="w-5 h-5" /></button>
-                      </div>
-                      {item.results && (
-                          <div className="px-4 pb-4 grid gap-4 border-t border-gray-50 pt-4">
-                            {item.results.map((r, idx) => (
-                              <AnalysisCard key={idx} result={r} originalFile={item.file || new File([], item.name)} itemIndex={idx+1} totalItems={item.results!.length} driveConfig={sourceConfig?.type === 'drive' ? {id: sourceConfig.id!, name: sourceConfig.name} : null} />
-                            ))}
-                          </div>
-                      )}
-                      {item.error && <div className="px-4 pb-4"><div className="bg-red-50 border border-red-100 text-red-700 text-[11px] p-3 rounded-xl font-bold">{item.error}</div></div>}
                     </div>
-                  ))}
                 </div>
-            </>
-        )}
+            )}
+        </aside>
       </main>
+      
+      {processingId && (
+          <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-50">
+              <div className="bg-brand-600 text-white px-8 py-4 rounded-full shadow-2xl flex items-center gap-4 border border-brand-400/50 animate-in slide-in-from-bottom-8">
+                  <ArrowPathIcon className="w-5 h-5 animate-spin" />
+                  <span className="text-[10px] font-black uppercase tracking-[0.2em]">{statusHeartbeat}</span>
+              </div>
+          </div>
+      )}
     </div>
   );
 };
-
-const XMarkIcon = ({ className }: { className?: string }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-);
 
 export default App;

@@ -15,7 +15,8 @@
     "react": "^19.2.3",
     "jszip": "3.10.1",
     "jspdf": "2.5.1",
-    "exceljs": "4.4.0"
+    "exceljs": "4.4.0",
+    "pdfjs-dist": "3.11.174"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

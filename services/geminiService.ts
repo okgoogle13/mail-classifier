@@ -1,58 +1,40 @@
 import { GoogleGenAI, Type, Schema } from "@google/genai";
 import { MailAnalysisResult, ClassificationType } from "../types";
 
-// Initialize Gemini Client
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 const SYSTEM_INSTRUCTION = `
-CLASSIFICATION MISSION:
-Extract → Route → Prioritize → Automate batch tagging/forwarding to UK Postbox.
+You are the high-intelligence Mail Classification Assistant for Nishant Dougall.
+Your mission: Extract data, route to the correct physical location, and prioritize action.
 
-=== 1. FIELD EXTRACTION (from PDF + metadata) ===
-- ukpostbox_ref: Parse from filename (e.g. "96279" from "96279_080725-01.pdf")
-- drive_file_id: Echo input ID (links back to Drive source)
-- filename: Echo input filename
-- upload_timestamp: Echo input timestamp  
-- week_batch_id: Echo input batch ID
-- recipient_name: Full name from envelope/content
-- delivery_address: Full postal address from envelope
-- sender: Sending org/person (e.g. "Nationwide Bank")
-- document_type: "bank statement", "PIN letter", etc.
-- date_on_document: YYYY-MM-DD from content
-- account_or_reference: Account/ref numbers
+=== CRITICAL: DATA EXTRACTION ===
+1. **UK POSTBOX REFERENCE (ID)**: This is the MOST IMPORTANT field.
+   - **Source Priority**: 
+     1. Metadata 'filename' (if available).
+     2. Document Header/Label (look for "Ref:", "Item:", or 5-7 digit codes).
+     3. Barcode Text.
+   - **Format**: Strictly numeric (e.g., "502391").
+   - **Sanitization**: Remove spaces from OCR'd IDs (e.g., "50 23 91" -> "502391").
+   - If not found, use "UNKNOWN_REF".
 
-=== 2. PRIORITIZED ROUTING RULES (STRICT ORDER) ===
+=== ROUTING LOGIC (STRICT) ===
+1. ADDRESS OVERRIDE: 
+   - "Flat 5 Old School Court" or "N17 6LY" -> forward_to_oz (AU)
+   - "10 Uist Wynd" or "KA7 4GF" or "Ayr" -> forward_to_ayr (UK)
+2. NAME FALLBACK (Only if address is missing/unclear):
+   - Arvind, Ashima, Molly -> forward_to_ayr
+   - Nishant -> forward_to_oz
+3. URGENCY FALLBACK:
+   - If routing is 'unknown' AND item is a Bill, Tax, or Legal Notice (HIGH/CRITICAL) -> forward_to_ayr
+4. DEFAULT: unknown
 
-RULE 1 (Address Override - HIGHEST PRIORITY):
-delivery_address contains "Flat 5 Old School Court" OR "N17 6LY" 
-→ routing = "forward_to_oz" (Nishant's London → Australia)
+=== PRIORITY ===
+- CRITICAL: PINs, Cards, Legal Docs, ID.
+- HIGH: Bills, Tax, Urgent Notice.
+- ROUTINE: Statements, General.
+- DIGITAL_ONLY: Marketing, Junk.
 
-RULE 2 (Parents' Scotland Address):
-delivery_address contains "10 Uist Wynd" OR "KA7 4GF" OR "Ayr" 
-→ routing = "forward_to_ayr" (parents' locker)
-
-RULE 3 (CONDITIONAL NAME FALLBACK - ONLY if Rules 1-2 fail):
-Check recipient_name ONLY after address rules:
-- "Arvind Dougall" OR "Ashima Dougall" OR "Molly Dougall" → "forward_to_ayr"
-- "Nishant Dougall" → "forward_to_oz"
-
-RULE 4: routing = "unknown" (queue for your app's manual review)
-
-⚠️ ADDRESS ALWAYS OVERRIDES NAME. No exceptions.
-
-=== 3. IMPORTANCE LEVELS ===
-CRITICAL_FORWARD: Cards/PINs/legal/IDs (auto-tag "urgent_forward")
-HIGH_FORWARD: Bills/tax/urgent (auto-tag "high_forward")  
-ROUTINE_OPTIONAL: Statements/updates (batch optional)
-DIGITAL_ONLY: Junk/marketing (auto-archive, save postage)
-
-=== 4. AUTOMATION FLAGS ===
-- DIGITAL_ONLY → auto_action = "archive_digital" 
-- CRITICAL_FORWARD + clear routing → auto_action = "batch_tag_forward"
-- Unknown/low confidence → auto_action = "human_review_queue" (your app's review table)
-
-=== 5. JSON OUTPUT ONLY (exact schema for your app) ===
-Your response MUST be a JSON object containing a list of analyzed items.
+OUTPUT: Return strictly JSON following the provided schema. Split multi-page PDFs into separate letters if you detect different addressees or senders.
 `;
 
 const RESPONSE_SCHEMA: Schema = {
@@ -66,46 +48,25 @@ const RESPONSE_SCHEMA: Schema = {
           ukpostbox_ref: { type: Type.STRING },
           drive_file_id: { type: Type.STRING },
           filename: { type: Type.STRING },
-          upload_timestamp: { type: Type.STRING },
-          week_batch_id: { type: Type.STRING },
           recipient_name: { type: Type.STRING },
           delivery_address: { type: Type.STRING },
           sender: { type: Type.STRING },
           document_type: { type: Type.STRING },
-          date_on_document: { type: Type.STRING, description: "YYYY-MM-DD" },
-          account_or_reference: { type: Type.STRING },
-          routing: { 
-            type: Type.STRING, 
-            enum: ["forward_to_ayr", "forward_to_oz", "unknown"] 
-          },
-          importance: { 
-            type: Type.STRING, 
-            enum: ["CRITICAL_FORWARD", "HIGH_FORWARD", "ROUTINE_OPTIONAL", "DIGITAL_ONLY"] 
-          },
-          auto_action: { 
-            type: Type.STRING, 
-            enum: ["batch_tag_forward", "archive_digital", "human_review_queue"] 
-          },
+          date_on_document: { type: Type.STRING },
+          routing: { type: Type.STRING, enum: ["forward_to_ayr", "forward_to_oz", "unknown"] },
+          importance: { type: Type.STRING, enum: ["CRITICAL_FORWARD", "HIGH_FORWARD", "ROUTINE_OPTIONAL", "DIGITAL_ONLY"] },
+          auto_action: { type: Type.STRING, enum: ["batch_tag_forward", "archive_digital", "human_review_queue"] },
           reasoning: { type: Type.STRING },
           confidence: { type: Type.STRING, enum: ["high", "medium", "low"] }
         },
-        required: [
-          "recipient_name", 
-          "delivery_address", 
-          "sender", 
-          "routing", 
-          "importance", 
-          "auto_action", 
-          "reasoning",
-          "filename"
-        ],
+        // Added ukpostbox_ref to required to force AI to attempt extraction
+        required: ["ukpostbox_ref", "recipient_name", "delivery_address", "sender", "routing", "importance", "auto_action", "reasoning", "filename"],
       }
     }
   },
   required: ["analysis_results"],
 };
 
-// Helper for delay
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export const analyzeMailItem = async (
@@ -114,33 +75,48 @@ export const analyzeMailItem = async (
     metadata?: any,
     onStatusUpdate?: (message: string) => void
 ): Promise<MailAnalysisResult[]> => {
-  const maxRetries = 6;
+  const maxRetries = 4;
   let attempt = 0;
 
-  const metadataString = metadata ? JSON.stringify(metadata, null, 2) : "{}";
+  // Supported MIME Check
+  if (!mimeType || mimeType.trim() === '') {
+      throw new Error("Unknown File Type: The file extension is missing or invalid. Please rename the file with .pdf or .jpg.");
+  }
+
+  const supportedMimes = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];
+  if (!supportedMimes.includes(mimeType.toLowerCase())) {
+    throw new Error(`Unsupported Format: The classifier cannot process "${mimeType}". Please convert to PDF, JPG, or PNG.`);
+  }
 
   while (attempt < maxRetries) {
     try {
-      if (onStatusUpdate && attempt > 0) {
-        onStatusUpdate(`Retry attempt ${attempt}...`);
+      if (onStatusUpdate) {
+        onStatusUpdate(attempt === 0 ? "Initiating AI Analysis..." : `Retrying analysis (Attempt ${attempt+1}/${maxRetries})...`);
       }
+
+      // Progress Simulation Milestones
+      const statusPhases = [
+        "Reading document text and layout...",
+        "Searching for Sender and UK Postbox ID...",
+        "Evaluating routing rules (Ayr vs Australia)...",
+        "Checking for deadlines and urgency...",
+        "Finalizing classification metadata..."
+      ];
+      
+      let phaseIdx = 0;
+      const phaseInterval = setInterval(() => {
+        if (onStatusUpdate && phaseIdx < statusPhases.length) {
+          onStatusUpdate(statusPhases[phaseIdx]);
+          phaseIdx++;
+        }
+      }, 4000);
 
       const response = await ai.models.generateContent({
         model: "gemini-3-pro-preview",
         contents: {
           parts: [
-            {
-              inlineData: {
-                mimeType: mimeType,
-                data: base64Data,
-              },
-            },
-            {
-              text: `METADATA_CONTEXT:
-${metadataString}
-
-Analyze this file. Segment it into as many distinct letters as possible. Identify the delivery address for each. Do not skip pages.`,
-            },
+            { inlineData: { mimeType: mimeType, data: base64Data } },
+            { text: `DOCUMENT CONTEXT: ${JSON.stringify(metadata)}\nPlease analyze this mail piece for Nishant Dougall's mailbox. Extract all distinct letters if multi-page.` },
           ],
         },
         config: {
@@ -151,91 +127,140 @@ Analyze this file. Segment it into as many distinct letters as possible. Identif
         },
       });
 
+      clearInterval(phaseInterval);
+
       if (!response.text) {
-        throw new Error("API returned empty response.");
+        throw new Error("Empty Response: The AI processed the file but found no identifiable text. The scan might be blank or too blurry.");
       }
 
       const parsed = JSON.parse(response.text);
-      const results = parsed.analysis_results || [];
-
-      return results.map((result: any) => {
-        let classification: ClassificationType;
+      return (parsed.analysis_results || []).map((result: any) => {
+        let classification: ClassificationType = ClassificationType.TBC;
         
-        if (result.routing === "forward_to_ayr") {
-            classification = ClassificationType.FORWARD_AYR;
-        } else if (result.routing === "forward_to_oz") {
-            classification = ClassificationType.FORWARD_OZ;
-        } else if (result.auto_action === "archive_digital") {
-             classification = ClassificationType.DIGITAL_STORE;
-        } else if (result.importance === "DIGITAL_ONLY") {
-             classification = ClassificationType.SHRED; 
-        } else if (result.auto_action === "human_review_queue" || result.routing === "unknown") {
-             classification = ClassificationType.TBC;
-        } else {
-             classification = ClassificationType.TBC;
+        // --- Fallback Routing Logic ---
+        // If routing is unknown but it's a High Priority Bill/Tax item, default to Ayr.
+        if (result.routing === "unknown" && (result.importance === "HIGH_FORWARD" || result.importance === "CRITICAL_FORWARD")) {
+             const lowerDoc = (result.document_type || "").toLowerCase();
+             // Broad check for financial/legal urgency terms
+             if (lowerDoc.includes('tax') || lowerDoc.includes('bill') || lowerDoc.includes('invoice') || lowerDoc.includes('demand') || lowerDoc.includes('legal') || lowerDoc.includes('notice')) {
+                 result.routing = "forward_to_ayr";
+                 result.reasoning = (result.reasoning || "") + " [Fallback: High Importance document routed to Ayr]";
+             }
         }
 
-        if ((result.importance === "CRITICAL_FORWARD" || result.importance === "HIGH_FORWARD") && classification !== ClassificationType.FORWARD_AYR && classification !== ClassificationType.FORWARD_OZ) {
-             classification = ClassificationType.DIGITAL_STORE_ACTION;
+        if (result.routing === "forward_to_ayr") classification = ClassificationType.FORWARD_AYR;
+        else if (result.routing === "forward_to_oz") classification = ClassificationType.FORWARD_OZ;
+        else if (result.auto_action === "archive_digital") classification = ClassificationType.DIGITAL_STORE;
+        else if (result.importance === "DIGITAL_ONLY") classification = ClassificationType.SHRED;
+
+        if ((result.importance === "CRITICAL_FORWARD" || result.importance === "HIGH_FORWARD") && 
+            classification !== ClassificationType.FORWARD_AYR && classification !== ClassificationType.FORWARD_OZ) {
+          classification = ClassificationType.DIGITAL_STORE_ACTION;
         }
 
         const dateStr = (result.date_on_document || "00000000").replace(/-/g, '');
-        let catCode = "TBC";
-        if (classification === ClassificationType.FORWARD_AYR) catCode = "FORWARD TO AYR";
-        else if (classification === ClassificationType.FORWARD_OZ) catCode = "FORWARD TO AU";
-        else if (classification === ClassificationType.DIGITAL_STORE) catCode = "DIGITAL STORE";
-        else if (classification === ClassificationType.DIGITAL_STORE_ACTION) catCode = "ACTION REQUIRED";
-        else if (classification === ClassificationType.SHRED) catCode = "SHRED";
+        const suggestedFilename = `${dateStr} [${result.sender || "Unknown"}] [${result.recipient_name || "Unknown"}]`;
+
+        // --- Robust ID Generation ---
         
-        const suggestedFilename = `${dateStr} [${result.sender || "Unknown"}] [${result.recipient_name || "Unknown"}] [${catCode}]`;
+        let cleanRef = result.ukpostbox_ref;
+
+        // 1. Sanitize the AI's output
+        if (typeof cleanRef === 'number') {
+            cleanRef = String(cleanRef);
+        }
+
+        if (typeof cleanRef === 'string') {
+            // Remove noise characters
+            let sanitized = cleanRef.replace(/['"]/g, '').trim();
+            
+            // Handle split OCR digits (e.g., "12 345")
+            // If the string contains only digits and spaces, compact it.
+            if (/^[\d\s]+$/.test(sanitized)) {
+                const compacted = sanitized.replace(/\s/g, '');
+                // Basic validation: UK Postbox IDs are typically 5-7 digits, but let's allow 4-9 to be safe.
+                if (compacted.length >= 4 && compacted.length <= 9) {
+                    sanitized = compacted;
+                }
+            }
+
+            const lower = sanitized.toLowerCase();
+            if (['null', 'none', 'n/a', 'unknown', '', 'unknown_ref', 'undefined', 'ref', 'id'].includes(lower)) {
+                cleanRef = null;
+            } else {
+                cleanRef = sanitized;
+            }
+        } else {
+            cleanRef = null;
+        }
+
+        // 2. Metadata Fallback (Highest Priority for ID)
+        // If the file is named "12345.pdf" or "Scan 12345.jpg", we extract that number.
+        if (metadata && metadata.filename) {
+            const fname = metadata.filename;
+            
+            // Regex to find sequences of 5 to 9 digits. 
+            // UK Postbox IDs are growing, but typically 5 or 6 digits.
+            const candidates = fname.match(/\d{5,9}/g);
+            
+            if (candidates && candidates.length > 0) {
+                // Heuristic: Prefer numbers that are 5-7 digits long (standard IDs).
+                // Longer numbers might be dates (e.g. 20241012 = 8 digits).
+                const bestCandidate = candidates.find(c => c.length >= 5 && c.length <= 7);
+                
+                if (bestCandidate) {
+                    cleanRef = bestCandidate;
+                } else {
+                    // If no 5-7 digit number, take the first one found (e.g. maybe it is an 8 digit ID or date used as ID).
+                    cleanRef = candidates[0];
+                }
+            }
+        }
+        
+        // 3. Last Resort: Generate Random ID
+        const finalItemId = cleanRef || `GEN-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
 
         return {
-          itemId: result.ukpostbox_ref || result.account_or_reference || Math.random().toString(36).substr(2, 6),
+          itemId: finalItemId,
           classification,
-          tag: result.auto_action || result.importance || "No Tag",
-          addressee: result.recipient_name || "Unknown",
-          sender: result.sender || "Unknown",
-          originalAddress: result.delivery_address || "Unknown",
-          reason: result.reasoning || "No reasoning provided",
+          tag: result.importance,
+          addressee: result.recipient_name,
+          sender: result.sender,
+          originalAddress: result.delivery_address,
+          reason: result.reasoning,
           deadline: result.date_on_document || "None",
           suggestedFilename,
-          ukpostbox_ref: result.ukpostbox_ref,
-          drive_file_id: result.drive_file_id,
-          week_batch_id: result.week_batch_id,
-          routing: result.routing,
-          importance: result.importance,
-          auto_action: result.auto_action,
-          document_type: result.document_type,
-          account_or_reference: result.account_or_reference,
-          confidence: result.confidence
-        } as MailAnalysisResult;
+          ...result,
+          ukpostbox_ref: finalItemId // Ensure the raw ref property in the object also matches the final ID
+        };
       });
 
     } catch (error: any) {
-      const status = error?.status || error?.code || 0;
-      const message = error?.message || '';
-
-      const isRateLimit = status === 429 || message.includes('Resource exhausted') || message.includes('429');
-      const isServiceUnavailable = status === 503 || status === 500;
-
-      if ((isRateLimit || isServiceUnavailable) && attempt < maxRetries - 1) {
-        const waitTime = Math.pow(2, attempt) * 2000 + Math.random() * 1000;
-        
-        if (onStatusUpdate) {
-            onStatusUpdate(`API busy. Pausing for ${Math.ceil(waitTime / 1000)}s...`);
-        }
-        
+      const status = error?.status;
+      const msg = error?.message || "Unknown error";
+      const isRateLimit = status === 429 || msg.toLowerCase().includes("exhausted") || msg.toLowerCase().includes("too many requests");
+      
+      if ((isRateLimit || status >= 500) && attempt < maxRetries - 1) {
+        const waitTime = Math.pow(2, attempt) * 5000 + 3000;
+        if (onStatusUpdate) onStatusUpdate(`Server busy. Re-attempting in ${Math.ceil(waitTime/1000)}s...`);
         await delay(waitTime);
         attempt++;
         continue;
       }
 
-      if (status === 400) throw new Error("Invalid File: The document appears to be corrupted or too large.");
-      if (status === 401) throw new Error("Authentication Failed: Check your API Key.");
-      if (status === 429) throw new Error("High Traffic: Please wait a moment.");
+      // User-Actionable Error Mapping
+      if (status === 400) {
+        throw new Error("File Error: The AI cannot read this file. It might be corrupted, password-protected, or zero-bytes. Please convert to a standard PDF or Image.");
+      }
+      if (status === 429) {
+        throw new Error("Traffic Jam: The AI service is experiencing high load. We reached the rate limit. Please wait a moment and retry.");
+      }
+      if (status >= 500) {
+        throw new Error("Service Outage: Google's AI is temporarily unreachable. Please try again in a few minutes.");
+      }
       
-      throw new Error(message || "Analysis failed due to a network error.");
+      throw new Error(msg);
     }
   }
-  throw new Error("Analysis failed after multiple retries. The model might be overloaded.");
+  throw new Error("Analysis Timeout: The AI took too long to respond. The document might be too complex or the service is slow.");
 };
